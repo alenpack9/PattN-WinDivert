@@ -10,15 +10,23 @@ namespace ServiceLib.Services.WinDivert;
 /// resolution is not poisoned and does not leak the requested domains.
 /// </para>
 /// </summary>
-public class WinDivertDnsResolver
+public class WinDivertDnsResolver : IDisposable
 {
-    private readonly string _dohUrl;
+    private const string DefaultPrimaryDoh = "https://1.1.1.1/dns-query";
+    private const string DefaultFallbackDoh = "https://8.8.8.8/dns-query";
+
+    private readonly string _primaryDohUrl;
+    private readonly string _fallbackDohUrl;
     private HttpClient? _httpClient;
     private int _proxyPort;
 
-    public WinDivertDnsResolver(string dohUrl)
+    public WinDivertDnsResolver(string? dohUrl)
     {
-        _dohUrl = dohUrl;
+        // Prefer direct IP addresses to avoid chicken-and-egg bootstrap DNS lookups
+        _primaryDohUrl = string.IsNullOrWhiteSpace(dohUrl) || dohUrl.Contains("cloudflare-dns.com")
+            ? DefaultPrimaryDoh
+            : dohUrl;
+        _fallbackDohUrl = DefaultFallbackDoh;
     }
 
     /// <summary>
@@ -35,6 +43,28 @@ public class WinDivertDnsResolver
             return null;
         }
 
+        // Try primary DoH first (e.g. 1.1.1.1)
+        var result = await QueryDohAsync(_primaryDohUrl, query, socksPort, token);
+        if (result != null)
+        {
+            return result;
+        }
+
+        // Fallback to secondary DoH (e.g. 8.8.8.8) if primary fails
+        if (!string.Equals(_primaryDohUrl, _fallbackDohUrl, StringComparison.OrdinalIgnoreCase))
+        {
+            result = await QueryDohAsync(_fallbackDohUrl, query, socksPort, token);
+            if (result != null)
+            {
+                return result;
+            }
+        }
+
+        return null;
+    }
+
+    private async Task<byte[]?> QueryDohAsync(string url, byte[] query, int socksPort, CancellationToken token)
+    {
         try
         {
             var client = GetClient(socksPort);
@@ -42,9 +72,9 @@ public class WinDivertDnsResolver
             content.Headers.ContentType = new MediaTypeHeaderValue("application/dns-message");
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
-            cts.CancelAfter(TimeSpan.FromSeconds(6));
+            cts.CancelAfter(TimeSpan.FromSeconds(5));
 
-            using var response = await client.PostAsync(_dohUrl, content, cts.Token);
+            using var response = await client.PostAsync(url, content, cts.Token);
             if (!response.IsSuccessStatusCode)
             {
                 return null;
@@ -78,15 +108,17 @@ public class WinDivertDnsResolver
 
         _httpClient?.Dispose();
 
-        var handler = new HttpClientHandler
+        var handler = new SocketsHttpHandler
         {
             UseProxy = true,
             Proxy = new WebProxy(new Uri($"socks5://{IPAddress.Loopback}:{socksPort}")),
+            ConnectTimeout = TimeSpan.FromSeconds(4),
+            PooledConnectionLifetime = TimeSpan.FromMinutes(2),
         };
 
         _httpClient = new HttpClient(handler)
         {
-            Timeout = TimeSpan.FromSeconds(8),
+            Timeout = TimeSpan.FromSeconds(7),
         };
         _proxyPort = socksPort;
 

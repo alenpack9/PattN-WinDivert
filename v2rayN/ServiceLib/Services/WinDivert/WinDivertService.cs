@@ -54,7 +54,9 @@ public class WinDivertService
                 EnableDnsHijack = config.WinDivertItem.EnableDnsHijack,
                 DropQuic = config.WinDivertItem.DropQuic,
                 BypassLan = config.WinDivertItem.BypassLan,
-                DnsUrl = config.WinDivertItem.DnsUrl.IsNullOrEmpty() ? "https://cloudflare-dns.com/dns-query" : config.WinDivertItem.DnsUrl,
+                DnsUrl = config.WinDivertItem.DnsUrl.IsNullOrEmpty() || config.WinDivertItem.DnsUrl.Contains("cloudflare-dns.com")
+                    ? "https://1.1.1.1/dns-query"
+                    : config.WinDivertItem.DnsUrl,
                 ProxyPort = _proxyPort,
             };
 

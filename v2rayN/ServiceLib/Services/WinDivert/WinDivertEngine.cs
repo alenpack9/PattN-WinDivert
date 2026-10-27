@@ -25,7 +25,7 @@ public class WinDivertOptions
     /// <summary>
     /// The dns-over-https server used to resolve the intercepted queries.
     /// </summary>
-    public string DnsUrl { get; set; } = "https://cloudflare-dns.com/dns-query";
+    public string DnsUrl { get; set; } = "https://1.1.1.1/dns-query";
 
     /// <summary>
     /// Local socks/mixed port of the running core.
@@ -44,7 +44,7 @@ public class WinDivertOptions
 public class WinDivertEngine : IDisposable
 {
     private const string _tag = "WinDivertEngine";
-    private const string _filter = "ip and (tcp or (udp and (udp.DstPort == 53 or udp.DstPort == 443)))";
+    private const string _filter = "(ip or ipv6) and (tcp or (udp and (udp.DstPort == 53 or udp.DstPort == 443 or udp.DstPort == 3478 or udp.DstPort == 19302)))";
 
     private readonly WinDivertRelay _relay;
     private readonly WinDivertDnsResolver _dnsResolver;
@@ -174,9 +174,23 @@ public class WinDivertEngine : IDisposable
     private void ProcessPacket(WinDivertBuffer packet, ref WinDivertAddress addr, uint len)
     {
         var result = WinDivertSharp.WinDivert.WinDivertHelperParsePacket(packet, len);
+
+        if (result.IsIPv6)
+        {
+            // Drop outbound IPv6 packets for intercepted protocols so Windows and applications
+            // immediately fall back to IPv4 (which is tunneled through proxy via WinDivert).
+            // This prevents IPv6 DNS leaks and real Iranian IPv6 address disclosure.
+            if (addr.Direction == WinDivertDirection.Outbound)
+            {
+                BypassedPackets++;
+                return;
+            }
+            SendPacket(packet, len, ref addr);
+            return;
+        }
+
         if (!result.IsIPv4)
         {
-            // ipv6/other protocols are not diverted
             SendPacket(packet, len, ref addr);
             return;
         }
@@ -311,9 +325,34 @@ public class WinDivertEngine : IDisposable
         var srcPort = (ushort)(((udpHeader.SrcPort & 0xFF) << 8) | ((udpHeader.SrcPort >> 8) & 0xFF));
         var dstPort = (ushort)(((udpHeader.DstPort & 0xFF) << 8) | ((udpHeader.DstPort >> 8) & 0xFF));
 
+        // 1. WebRTC STUN Leak prevention (ports 3478, 19302):
+        // Drop outbound STUN requests so WebRTC in browsers cannot discover the real Iranian public IP.
+        if (dstPort == 3478 || dstPort == 19302)
+        {
+            BypassedPackets++;
+            return;
+        }
+
         if (dstPort != 53 && dstPort != 443)
         {
             SendPacket(packet, len, ref addr);
+            return;
+        }
+
+        // 2. DNS Hijack (port 53):
+        // MUST be checked BEFORE ShouldBypass because 99.9% of home routers configure DNS as
+        // a private LAN IP (192.168.1.1). If we checked ShouldBypass first, all DNS queries
+        // to the router would be bypassed directly to TIC (Iran), causing severe DNS leaks!
+        if (dstPort == 53 && _options.EnableDnsHijack)
+        {
+            var pid = WinDivertProcessResolver.GetPidForLocalUdpPort(srcPort);
+            if (pid > 0 && (_excludedPids.ContainsKey(pid) || pid == Environment.ProcessId))
+            {
+                SendPacket(packet, len, ref addr);
+                return;
+            }
+
+            HandleDnsQuery(packet, ref addr, len, result, srcPort);
             return;
         }
 
@@ -321,12 +360,6 @@ public class WinDivertEngine : IDisposable
         {
             BypassedPackets++;
             SendPacket(packet, len, ref addr);
-            return;
-        }
-
-        if (dstPort == 53 && _options.EnableDnsHijack)
-        {
-            HandleDnsQuery(packet, ref addr, len, result);
             return;
         }
 
@@ -341,13 +374,11 @@ public class WinDivertEngine : IDisposable
         SendPacket(packet, len, ref addr);
     }
 
-    private void HandleDnsQuery(WinDivertBuffer packet, ref WinDivertAddress addr, uint len, WinDivertParseResult result)
+    private void HandleDnsQuery(WinDivertBuffer packet, ref WinDivertAddress addr, uint len, WinDivertParseResult result, ushort clientPort)
     {
         ref var ipHeader = ref result.IPv4Header;
-        ref var udpHeader = ref result.UdpHeader;
 
         var clientIp = ipHeader.SrcAddr;
-        var clientPort = (ushort)(((udpHeader.SrcPort & 0xFF) << 8) | ((udpHeader.SrcPort >> 8) & 0xFF));
         var serverIp = ipHeader.DstAddr;
 
         var payload = result.PacketPayload;
@@ -358,14 +389,9 @@ public class WinDivertEngine : IDisposable
         }
 
         var query = payload.ToArray();
-        var originalPacket = new byte[len];
-        for (var i = 0; i < len; i++)
-        {
-            originalPacket[i] = packet[(uint)i];
-        }
         var originalAddr = addr;
 
-        // the query is dropped here, it is answered by the resolver
+        // the query is dropped here, it is answered by the encrypted DoH resolver
         _ = Task.Run(async () =>
         {
             try
@@ -377,16 +403,37 @@ public class WinDivertEngine : IDisposable
                 }
                 else
                 {
-                    // fallback, let the system resolver answer the query
-                    InjectPacket(originalPacket, originalAddr);
+                    // NEVER leak to the unencrypted system resolver (TIC - Iran) on failure!
+                    // Return a DNS Server Failure (SERVFAIL) response so the client retries via proxy.
+                    var servFail = BuildDnsServFailResponse(query);
+                    if (servFail != null)
+                    {
+                        InjectDnsResponse(serverIp, clientIp, clientPort, servFail, originalAddr);
+                    }
                 }
             }
             catch (Exception ex)
             {
                 Logging.SaveLog(_tag, ex);
-                InjectPacket(originalPacket, originalAddr);
             }
         });
+    }
+
+    private static byte[]? BuildDnsServFailResponse(byte[] query)
+    {
+        if (query.Length < 12)
+        {
+            return null;
+        }
+
+        var response = new byte[12];
+        response[0] = query[0]; // ID high
+        response[1] = query[1]; // ID low
+        response[2] = 0x81;     // QR=1, RD=1
+        response[3] = 0x82;     // RA=1, RCODE=2 (Server Failure)
+        response[4] = query[4]; // QDCOUNT high
+        response[5] = query[5]; // QDCOUNT low
+        return response;
     }
 
     /// <summary>
@@ -595,6 +642,7 @@ public class WinDivertEngine : IDisposable
         try
         {
             using var buffer = new WinDivertBuffer(bytes);
+            WinDivertSharp.WinDivert.WinDivertHelperCalcChecksums(buffer, (uint)bytes.Length, ref addr, WinDivertChecksumHelperParam.All);
             WinDivertSharp.WinDivert.WinDivertSend(_handle, buffer, (uint)bytes.Length, ref addr);
         }
         catch (Exception ex)
